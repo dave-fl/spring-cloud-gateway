@@ -16,22 +16,20 @@
 
 package org.springframework.cloud.gateway.filter.factory;
 
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
-import java.util.Optional;
-import java.util.function.Predicate;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.reactivestreams.Publisher;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.support.TimeoutException;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatus.Series;
 import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
+import org.springframework.util.Assert;
+import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.retry.Repeat;
@@ -39,13 +37,9 @@ import reactor.retry.RepeatContext;
 import reactor.retry.Retry;
 import reactor.retry.RetryContext;
 
-import org.springframework.cloud.gateway.filter.GatewayFilter;
-import org.springframework.cloud.gateway.support.TimeoutException;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.HttpStatus.Series;
-import org.springframework.util.Assert;
-import org.springframework.web.server.ServerWebExchange;
+import java.io.IOException;
+import java.util.*;
+import java.util.function.Predicate;
 
 import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.CLIENT_RESPONSE_HEADER_NAMES;
 import static org.springframework.cloud.gateway.support.ServerWebExchangeUtils.GATEWAY_ALREADY_ROUTED_ATTR;
@@ -59,6 +53,8 @@ public class RetryGatewayFilterFactory
 	public static final String RETRY_ITERATION_KEY = "retry_iteration";
 
 	public static final String RETRY_BODY_KEY = "retry_body";
+
+	private static final byte[] EMPTY_BODY = new byte[0];
 
 	private static final Log log = LogFactory.getLog(RetryGatewayFilterFactory.class);
 
@@ -164,16 +160,20 @@ public class RetryGatewayFilterFactory
 	public Mono<Void> preparedRequest(ServerWebExchange exchange,
 			GatewayFilterChain chain) {
 		return Mono.defer(() -> {
-			Optional<DataBuffer> cachedRequestBuffer = exchange
-					.getAttributeOrDefault(RETRY_BODY_KEY, null);
+			byte[] cachedRequestBuffer = exchange.getAttributeOrDefault(RETRY_BODY_KEY,
+					null);
 
-			Mono<Optional<DataBuffer>> preparedRequest;
+			Mono<byte[]> preparedRequest;
 			// Place the original request buffer into the context as a single aggregated
 			// buffer
 			if (cachedRequestBuffer == null) {
 				preparedRequest = DataBufferUtils.join(exchange.getRequest().getBody())
-						.map(dataBuffer -> Optional.of(dataBuffer))
-						.defaultIfEmpty(Optional.empty())
+						.map(dataBuffer -> {
+							byte[] bytes = new byte[dataBuffer.readableByteCount()];
+							dataBuffer.read(bytes);
+							DataBufferUtils.release(dataBuffer);
+							return bytes;
+						}).defaultIfEmpty(EMPTY_BODY)
 						.doOnNext(optionalDataBuffer -> exchange.getAttributes()
 								.put(RETRY_BODY_KEY, optionalDataBuffer));
 			}
@@ -181,20 +181,15 @@ public class RetryGatewayFilterFactory
 				preparedRequest = Mono.just(cachedRequestBuffer);
 			}
 			return preparedRequest;
-		}).flatMap(optionalDataBuffer -> {
+		}).flatMap(bytes -> {
 			ServerHttpRequestDecorator decorator = new ServerHttpRequestDecorator(
 					exchange.getRequest()) {
 				@Override
 				public Flux<DataBuffer> getBody() {
-					if (optionalDataBuffer.isPresent()) {
-						DataBuffer dataBuffer = optionalDataBuffer.get();
-						return Flux.defer(() -> {
-							// Retain the buffer, we will release down the chain
-							DataBufferUtils.retain(dataBuffer);
-							return Flux.just(
-									dataBuffer.slice(0, dataBuffer.readableByteCount()));
-						});
-
+					if (bytes != EMPTY_BODY) {
+						// No allocate, just wrap
+						return Flux
+								.just(exchange.getResponse().bufferFactory().wrap(bytes));
 					}
 					return Flux.empty();
 				}
@@ -232,18 +227,7 @@ public class RetryGatewayFilterFactory
 						.repeatWhen(repeat.withApplicationContext(exchange));
 			}
 
-			return Mono.fromDirect(publisher).doFinally(signalType -> {
-				Optional<DataBuffer> originalRequestBuffer = exchange
-						.getAttributeOrDefault(RETRY_BODY_KEY, Optional.empty());
-				// If we have a buffer here then attempt to release it. We assume that
-				// downstream will always clean
-				// up a body that has been read. When we no longer have to replay or
-				// retry, we must clean up what
-				// we originally retained.
-				if (originalRequestBuffer.isPresent()) {
-					DataBufferUtils.release(originalRequestBuffer.get());
-				}
-			});
+			return Mono.fromDirect(publisher);
 		};
 	}
 
